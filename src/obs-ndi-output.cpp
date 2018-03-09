@@ -20,6 +20,7 @@ License along with this library. If not, see <https://www.gnu.org/licenses/>
 #include <util/platform.h>
 #include <util/threading.h>
 #include <util/profiler.h>
+#include <util/circlebuf.h>
 
 #include "obs-ndi.h"
 
@@ -82,9 +83,7 @@ bool ndi_output_start(void* data) {
             break;
 
         case VIDEO_FORMAT_RGBA:
-            // There won't be transparency in the output data, so
-            // ignore the alpha channel
-            o->frame_format = NDIlib_FourCC_type_RGBX;
+            o->frame_format = NDIlib_FourCC_type_RGBA;
             break;
 
         case VIDEO_FORMAT_BGRA:
@@ -104,18 +103,16 @@ bool ndi_output_start(void* data) {
     send_desc.clock_audio = false;
 
     o->ndi_sender = ndiLib->NDIlib_send_create(&send_desc);
-
     if (o->ndi_sender) {
-        o->started = true;
-        obs_output_begin_data_capture(o->output, 0);
-
-        if (o->async_sending) {
-            blog(LOG_INFO, "asynchronous video sending enabled");
-        } else {
-            blog(LOG_INFO, "asynchronous video sending disabled");
+        o->started = obs_output_begin_data_capture(o->output, 0);
+        if (o->started) {
+            if (o->async_sending) {
+                blog(LOG_INFO, "asynchronous video sending enabled");
+            }
+            else {
+                blog(LOG_INFO, "asynchronous video sending disabled");
+            }
         }
-    } else {
-        o->started = false;
     }
 
     return o->started;
@@ -123,8 +120,13 @@ bool ndi_output_start(void* data) {
 
 void ndi_output_stop(void* data, uint64_t ts) {
     struct ndi_output* o = static_cast<ndi_output*>(data);
+
     o->started = false;
     obs_output_end_data_capture(o->output);
+
+    ndiLib->NDIlib_send_destroy(o->ndi_sender);
+    delete o->conv_buffer;
+    o->conv_buffer = nullptr;
 }
 
 void ndi_output_update(void* data, obs_data_t* settings) {
@@ -134,21 +136,18 @@ void ndi_output_update(void* data, obs_data_t* settings) {
 }
 
 void* ndi_output_create(obs_data_t* settings, obs_output_t* output) {
-    UNUSED_PARAMETER(settings);
-
     struct ndi_output* o =
         static_cast<ndi_output*>(bzalloc(sizeof(struct ndi_output)));
     o->output = output;
     o->started = false;
+
     ndi_output_update(o, settings);
 
     return o;
 }
 
 void ndi_output_destroy(void* data) {
-    struct ndi_output* o = static_cast<ndi_output*>(data);
-    ndiLib->NDIlib_send_destroy(o->ndi_sender);
-    delete o->conv_buffer;
+    UNUSED_PARAMETER(data);
 }
 
 void convert_nv12_to_uyvy(uint8_t* input[], uint32_t in_linesize[],
@@ -249,25 +248,19 @@ void ndi_output_rawvideo(void* data, struct video_data* frame) {
         video_format source_f = o->video_info.output_format;
 
         if (source_f == VIDEO_FORMAT_NV12) {
-            profile_start("convert_nv12_to_uyvy");
             convert_nv12_to_uyvy(frame->data, frame->linesize,
                 0, height,
                 o->conv_buffer, o->conv_linesize);
-            profile_end("convert_nv12_to_uyvy");
         }
         else if (source_f == VIDEO_FORMAT_I420) {
-            profile_start("convert_i420_to_uyvy");
             convert_i420_to_uyvy(frame->data, frame->linesize,
                 0, height,
                 o->conv_buffer, o->conv_linesize);
-            profile_end("convert_i420_to_uyvy");
         }
         else if (source_f == VIDEO_FORMAT_I444) {
-            profile_start("convert_i444_to_uyvy");
             convert_i444_to_uyvy(frame->data, frame->linesize,
                 0, height,
                 o->conv_buffer, o->conv_linesize);
-            profile_end("convert_i444_to_uyvy");
         }
 
         video_frame.p_data = o->conv_buffer;
@@ -305,7 +298,7 @@ void ndi_output_rawaudio(void* data, struct audio_data* frame) {
     }
 
     audio_frame.p_data = (float*)audio_data;
-    audio_frame.timecode = (int64_t)(frame->timestamp / 100.0);
+    audio_frame.timecode = (int64_t)(frame->timestamp / 100);
 
     ndiLib->NDIlib_send_send_audio_v2(o->ndi_sender, &audio_frame);
     bfree(audio_data);
